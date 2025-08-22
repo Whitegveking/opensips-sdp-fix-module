@@ -2,6 +2,7 @@
 *.so
 *.o
 *.a
+*.d
 
 # archives
 *.tar.gz
