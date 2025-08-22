@@ -1,0 +1,22 @@
+# compiled binaries / libs
+*.so
+*.o
+*.a
+
+# archives
+*.tar.gz
+*.deb
+*.zip
+
+# large media / captures
+*.pcap
+*.mp4
+
+# build dirs
+build/
+ffmpeg-4.4/
+ffmpeg-learning/build/
+
+# editor / OS files
+*.swp
+.DS_Store
