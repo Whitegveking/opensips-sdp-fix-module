@@ -852,15 +852,46 @@ static char *build_fixed_audio_sdp(sdp_info_t *original_sdp, session_context_t *
         return NULL;
     }
 
-    // 复制原始SDP会话级别的信息
+    // 复制原始SDP会话级别的信息（只到第一个m=行）
     if (original_sdp->sessions && original_sdp->sessions->body.s)
     {
-        char *session_end = strstr(original_sdp->sessions->body.s, "m=");
+        char *session_start = original_sdp->sessions->body.s;
+        char *session_end = strstr(session_start, "m=");
+
         if (session_end)
         {
-            int session_len = session_end - original_sdp->sessions->body.s;
+            int session_len = session_end - session_start;
+
+            LM_INFO("SDP_FIX: Original session info (first 20 chars): '%.20s'\n", session_start);
+
+            // 检查并修复重复的v=行
+            if (session_len >= 2 && strncmp(session_start, "v=", 2) == 0)
+            {
+                // 跳过重复的"v="，保留"v=0"
+                session_start += 2;
+                session_len -= 2;
+                LM_INFO("SDP_FIX: Fixed duplicate v= line in session header\n");
+            }
+
+            // 确保会话信息正确复制
             pos += snprintf(buffer + pos, buf_size - pos, "%.*s",
-                            session_len, original_sdp->sessions->body.s);
+                            session_len, session_start);
+
+            LM_INFO("SDP_FIX: Copied session info, buffer now (first 30 chars): '%.30s'\n", buffer);
+        }
+        else
+        {
+            // 如果没有媒体流，复制整个会话
+            int total_len = strlen(session_start);
+            LM_INFO("SDP_FIX: No media streams, session info (first 20 chars): '%.20s'\n", session_start);
+
+            if (total_len >= 4 && strncmp(session_start, "v=v=", 4) == 0)
+            {
+                session_start += 2;
+                total_len -= 2;
+                LM_INFO("SDP_FIX: Fixed duplicate v= line in session-only SDP\n");
+            }
+            pos += snprintf(buffer + pos, buf_size - pos, "%s", session_start);
         }
     }
 
@@ -874,7 +905,7 @@ static char *build_fixed_audio_sdp(sdp_info_t *original_sdp, session_context_t *
             LM_INFO("SDP_FIX: Processing audio stream, UPDATE has %d codecs, Reply has %d codecs\n",
                     ctx->update_audio.codec_count, ctx->reply_audio.codec_count);
 
-            // 音频流：使用UPDATE请求中的负载类型替换200 OK中的不匹配类型
+            // 构建修复后的音频流：保持200 OK的编解码器顺序，但使用UPDATE的PT
             pos += snprintf(buffer + pos, buf_size - pos,
                             "m=audio %.*s RTP/AVP",
                             stream->port.len, stream->port.s);
@@ -883,7 +914,7 @@ static char *build_fixed_audio_sdp(sdp_info_t *original_sdp, session_context_t *
             for (int j = 0; j < ctx->reply_audio.codec_count; j++)
             {
                 codec_info_t *reply_codec = &ctx->reply_audio.codecs[j];
-                int update_pt = -1; // 要使用的UPDATE payload type
+                int update_pt = -1;
 
                 LM_INFO("SDP_FIX: Processing Reply codec[%d]: PT=%d, Name='%.*s', Rate=%d\n",
                         j, reply_codec->payload_type,
@@ -900,7 +931,6 @@ static char *build_fixed_audio_sdp(sdp_info_t *original_sdp, session_context_t *
                                     update_codec->codec_name.len) == 0 &&
                         update_codec->sample_rate == reply_codec->sample_rate)
                     {
-                        // 找到匹配的编解码器，使用UPDATE中的payload type
                         update_pt = update_codec->payload_type;
                         LM_INFO("SDP_FIX: Match found! Using UPDATE PT=%d for Reply codec %.*s/%d (was PT=%d)\n",
                                 update_pt,
@@ -917,7 +947,6 @@ static char *build_fixed_audio_sdp(sdp_info_t *original_sdp, session_context_t *
                 }
                 else
                 {
-                    // 没找到匹配的，使用原来的payload type
                     pos += snprintf(buffer + pos, buf_size - pos, " %d", reply_codec->payload_type);
                     LM_INFO("SDP_FIX: No UPDATE match found, keeping original PT=%d for %.*s/%d\n",
                             reply_codec->payload_type,
@@ -935,11 +964,18 @@ static char *build_fixed_audio_sdp(sdp_info_t *original_sdp, session_context_t *
                                 stream->ip_addr.len, stream->ip_addr.s);
             }
 
-            // 添加rtpmap和fmtp属性（基于200 OK中的编解码器，但使用UPDATE中的payload type）
+            // 添加rtpmap和fmtp属性（保持200 OK的顺序，但跳过telephone-event）
             for (int j = 0; j < ctx->reply_audio.codec_count; j++)
             {
                 codec_info_t *reply_codec = &ctx->reply_audio.codecs[j];
-                int final_pt = reply_codec->payload_type; // 默认使用原来的PT
+
+                // 跳过telephone-event，会在后面单独处理
+                if (strncasecmp(reply_codec->codec_name.s, "telephone-event", 15) == 0)
+                {
+                    continue;
+                }
+
+                int final_pt = reply_codec->payload_type;
 
                 // 查找UPDATE中匹配的编解码器以获取正确的payload type
                 for (int i = 0; i < ctx->update_audio.codec_count; i++)
@@ -951,13 +987,14 @@ static char *build_fixed_audio_sdp(sdp_info_t *original_sdp, session_context_t *
                                     update_codec->codec_name.len) == 0 &&
                         update_codec->sample_rate == reply_codec->sample_rate)
                     {
-                        final_pt = update_codec->payload_type; // 使用UPDATE中的PT
+                        final_pt = update_codec->payload_type;
                         break;
                     }
                 }
 
-                // 添加rtpmap
-                if (reply_codec->channels > 1)
+                // 添加rtpmap - 对于AMR和AMR-WB总是包含声道数
+                if (reply_codec->channels > 1 ||
+                    strncasecmp(reply_codec->codec_name.s, "AMR", 3) == 0)
                 {
                     pos += snprintf(buffer + pos, buf_size - pos,
                                     "a=rtpmap:%d %.*s/%d/%d\r\n",
@@ -986,7 +1023,59 @@ static char *build_fixed_audio_sdp(sdp_info_t *original_sdp, session_context_t *
                 }
             }
 
-            // 复制其他媒体属性（除了rtpmap和fmtp）
+            // 2. 处理telephone-event（只保留一个，优先8000Hz）
+            codec_info_t *selected_event_codec = NULL;
+            int selected_event_pt = -1;
+
+            for (int j = 0; j < ctx->reply_audio.codec_count; j++)
+            {
+                codec_info_t *reply_codec = &ctx->reply_audio.codecs[j];
+
+                if (strncasecmp(reply_codec->codec_name.s, "telephone-event", 15) != 0)
+                {
+                    continue;
+                }
+
+                // 如果还没选择或当前是8000Hz，则选择这个
+                if (selected_event_codec == NULL || reply_codec->sample_rate == 8000)
+                {
+                    selected_event_codec = reply_codec;
+                    selected_event_pt = reply_codec->payload_type;
+
+                    // 查找UPDATE中匹配的telephone-event
+                    for (int i = 0; i < ctx->update_audio.codec_count; i++)
+                    {
+                        codec_info_t *update_codec = &ctx->update_audio.codecs[i];
+
+                        if (strncasecmp(update_codec->codec_name.s, "telephone-event", 15) == 0 &&
+                            update_codec->sample_rate == reply_codec->sample_rate)
+                        {
+                            selected_event_pt = update_codec->payload_type;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 添加选择的telephone-event
+            if (selected_event_codec != NULL)
+            {
+                pos += snprintf(buffer + pos, buf_size - pos,
+                                "a=rtpmap:%d %.*s/%d\r\n",
+                                selected_event_pt,
+                                selected_event_codec->codec_name.len, selected_event_codec->codec_name.s,
+                                selected_event_codec->sample_rate);
+
+                if (selected_event_codec->fmtp_params.s && selected_event_codec->fmtp_params.len > 0)
+                {
+                    pos += snprintf(buffer + pos, buf_size - pos,
+                                    "a=fmtp:%d %.*s\r\n",
+                                    selected_event_pt,
+                                    selected_event_codec->fmtp_params.len,
+                                    selected_event_codec->fmtp_params.s);
+                }
+            }
+
             // 添加媒体方向属性
             if (stream->sendrecv_mode.s && stream->sendrecv_mode.len > 0)
             {
